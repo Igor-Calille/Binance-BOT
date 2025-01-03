@@ -37,6 +37,16 @@ def buy_btc_with_usdt(quant):
     except Exception as e:
         print("Erro ao comprar BTC:", e)
 
+def sell(quantity):
+    try:
+        order = client.order_market_sell(symbol='BNBUSDT', quantity=quantity)
+        print("Ordem de venda executada:", order)
+        return order
+    except Exception as e:
+        print("Erro ao vender BTC:", e)
+        return None
+response = sell(1.0)
+
 # Exemplo de uso
 usdt_balance = get_usdt_balance()
 print("Saldo de USDT na Testnet:", usdt_balance)
@@ -49,9 +59,12 @@ min_qty, step_size = get_lot_size('BTCUSDT')
 print(f"Quantidade mínima: {min_qty}, Incremento: {step_size}")
 
 
-btc_quantity_to_buy = (usdt_balance * 0.1) / btcusdt_price
 
-btc_quantity_to_buy = round(btc_quantity_to_buy // step_size * step_size, 6)
+
+
+#btc_quantity_to_buy = (usdt_balance * 0.1) / btcusdt_price
+
+#btc_quantity_to_buy = round(btc_quantity_to_buy // step_size * step_size, 6)
 
 #if btc_quantity_to_buy >= min_qty:
     #buy_btc_with_usdt(round(btc_quantity_to_buy, 6))

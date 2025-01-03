@@ -1,10 +1,10 @@
 import backtrader as bt
-from backtest import MLStrategy
 import pandas as pd
+from backtest import MLStrategy
 
-# Adicionar função para rodar backtesting
-def run_backtesting(data_file='df.csv', initial_cash=10000.0):
-    # Carregar os dados históricos com sinais preditivos
+# Função para rodar o backtesting
+def run_backtesting(data_file='df.csv', initial_cash=10000.0, start_date=None):
+    # Carregar os dados históricos
     data = pd.read_csv(data_file, parse_dates=['Close Time'], index_col='Close Time')
 
     # Adicionar os sinais e preços como dados para backtrader
@@ -20,11 +20,50 @@ def run_backtesting(data_file='df.csv', initial_cash=10000.0):
             ('signal_ml', 'signal_ml'),
         )
 
+    # Estratégia personalizada para iniciar trades após a data definida
+    class FilteredMLStrategy(bt.Strategy):
+        params = (('start_date', None),)
+
+        def __init__(self):
+            self.start_date = pd.to_datetime(self.params.start_date) if self.params.start_date else None
+
+        def next(self):
+            # Ignorar trades antes da data de início
+            if self.start_date and self.datas[0].datetime.date(0) < self.start_date.date():
+                return
+
+            # Obter saldo atual e posição
+            cash = self.broker.getcash()  # Saldo em caixa
+            position = self.getposition(self.datas[0]).size  # Quantidade do ativo
+            close_price = self.data.close[0]
+            signal = self.data.signal_ml[0]  # Obtém o sinal atual
+
+            # Debugging: Exibir informações básicas
+            print(f"Data: {self.datas[0].datetime.date(0)}, Signal: {signal}, Cash: {cash:.2f}, Position: {position}, Close Price: {close_price:.2f}")
+
+            # Garantir que o preço seja válido
+            if not close_price or close_price <= 0:
+                print("Preço inválido. Ignorando.")
+                return
+
+            # Sinal de compra
+            if signal == 1:
+                size = (cash * 0.98) / close_price  # Usa 98% do caixa para compra
+                size = max(size, 0.001)  # Garantir tamanho mínimo
+                self.buy(size=size)
+                print(f"Comprando {size:.4f} unidades a {close_price:.2f}")
+
+            # Sinal de venda
+            elif signal == -1:
+                self.sell(size=position)  # Vende tudo
+                print(f"Vendendo {position:.4f} unidades a {close_price:.2f}")
+
+
     # Configuração do ambiente de backtesting
     cerebro = bt.Cerebro()
-    cerebro.addstrategy(MLStrategy)
+    cerebro.addstrategy(FilteredMLStrategy, start_date=start_date)
 
-    # Adicionar os dados ao backtesting
+    # Adicionar os dados ao ambiente
     data_feed = PandasData(dataname=data)
     cerebro.adddata(data_feed)
 
@@ -40,6 +79,9 @@ def run_backtesting(data_file='df.csv', initial_cash=10000.0):
     # Exibir o gráfico de resultados
     cerebro.plot()
 
-# Rodar o backtesting ao final
+# Executar o backtesting
 if __name__ == "__main__":
-    run_backtesting()
+    # Especificar a data de início para os trades
+    run_backtesting(data_file='df.csv', start_date='2024-12-20')
+
+

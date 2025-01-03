@@ -1,277 +1,537 @@
-from binance.client import Client
-from dotenv import load_dotenv
 import os
 import time
-import pandas as pd
+import math
+import logging
+import subprocess
+import threading
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from binance.client import Client
+
 from IndicadoresMercado import Indicadores
 from MLModels import using_RandomForestRegressor
-import numpy as np
-import subprocess
-from collections import deque
+from backtest import Backtest  # <- seu arquivo backtest.py
 
+# -----------------------------------------------------------------------
+#                       CONFIGURAÇÕES DO LOG
+# -----------------------------------------------------------------------
+logging.basicConfig(
+    filename='trade.log',
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------
+#                       CONFIGURAÇÕES DO BOT
+# -----------------------------------------------------------------------
 load_dotenv()
 
-# Utilize as chaves de API do Testnet
+SYMBOL = "BNBUSDT"
+BASE_ASSET = "BNB"
+QUOTE_ASSET = "USDT"
+
+# Exemplo de SL e TP fixos para Altcoins
+STOP_LOSS_PCT = 0.15   
+TAKE_PROFIT_PCT = 0.22 
+
+RISK_PERCENT_CAPITAL = 0.70   # 70% do saldo p/ comprar ou vender (DCA)
+RETRAIN_INTERVAL = 5
+MAX_CANDLES = 5555
+
+# Intervalos
+KLINE_INTERVAL = Client.KLINE_INTERVAL_1HOUR   # candle de 1 hora
+SL_TP_CHECK_INTERVAL = 25 * 60  # 25 minutos => 1500s
+
+# Credenciais (testnet ou principal)
 testnet_api_key = os.getenv('TESTNET_API_KEY')
 testnet_api_secret = os.getenv('TESTNET_API_SECRET')
-
-# Conecte-se ao cliente Binance Testnet
 client = Client(testnet_api_key, testnet_api_secret)
-client.API_URL = 'https://testnet.binance.vision/api'  # Endpoint para o Binance Spot Testnet
+client.API_URL = 'https://testnet.binance.vision/api'
 
 api_key = os.getenv('API_KEY')
 api_secret = os.getenv('API_SECRET')
-
 client2 = Client(api_key, api_secret)
 
-# Intervalo dos candles para 2 horas
-KLINE_INTERVAL = Client.KLINE_INTERVAL_2HOUR
-
-# Comando para iniciar o serviço de sincronização de tempo do Windows
+# Inicia serviço de tempo (Windows)
 start_service = subprocess.run(["net", "start", "w32time"], capture_output=True, text=True)
-print("Iniciando serviço de tempo:")
-print(start_service.stdout)
-print(start_service.stderr)
+logger.info("Iniciando serviço de tempo do Windows...")
+logger.info(start_service.stdout)
+if start_service.stderr:
+    logger.error(start_service.stderr)
 
-# Função para obter o saldo de USDT
-def get_usdt_balance():
-    balance = client.get_asset_balance(asset='USDT')
-    return float(balance['free']) if balance else 0.0
+# -----------------------------------------------------------------------
+#             VARIÁVEIS GLOBAIS DE CONTROLE DE POSIÇÃO
+# -----------------------------------------------------------------------
+open_position = False
+entry_price   = 0.0
+entry_quantity= 0.0
 
-# Função para obter o saldo de BTC
-def get_btc_balance():
-    balance = client.get_asset_balance(asset='BTC')
-    return float(balance['free']) if balance else 0.0
-
-# Função para obter o preço de BTCUSDT
-def get_btcusdt_price():
-    ticker = client.get_symbol_ticker(symbol='BTCUSDT')
-    return float(ticker['price'])
-
-# Função para obter os limites permitidos para o par de negociação
-def get_lot_size_limits(symbol):
-    symbol_info = client.get_symbol_info(symbol)
-    if symbol_info:
-        for filter in symbol_info['filters']:
-            if filter['filterType'] == 'LOT_SIZE':
-                min_qty = float(filter['minQty'])
-                max_qty = float(filter['maxQty'])
-                step_size = float(filter['stepSize'])
-                return min_qty, max_qty, step_size
-    return None, None, None
-
-# Função para ajustar a quantidade com base nos limites de LOT_SIZE
-def adjust_quantity(quantity, min_qty, max_qty, step_size):
-    if quantity < min_qty:
-        return 0  # Quantidade muito pequena, ignora a operação
-    if quantity > max_qty:
-        quantity = max_qty  # Limita ao máximo permitido
-    # Ajusta para o múltiplo mais próximo do step_size
-    quantity = quantity - (quantity % step_size)
-    return round(quantity, 6)  # Arredonda para 6 casas decimais
-
-# Função para comprar BTC com USDT
-def buy_btc(quantity):
+# -----------------------------------------------------------------------
+#                       FUNÇÕES AUXILIARES
+# -----------------------------------------------------------------------
+def get_asset_balance(asset: str) -> float:
+    """Retorna o saldo 'free' (disponível) de um ativo."""
     try:
-        order = client.order_market_buy(symbol='BTCUSDT', quantity=quantity)
-        print("Ordem de compra executada:", order)
+        balance = client.get_asset_balance(asset=asset)
+        if balance:
+            return float(balance['free'])
+        else:
+            return 0.0
+    except Exception as e:
+        logger.error(f"Erro ao obter saldo de {asset}: {e}")
+        return 0.0
+
+def get_symbol_price(symbol: str) -> float:
+    """Retorna o último preço do par (ticker)."""
+    try:
+        ticker = client.get_symbol_ticker(symbol=symbol)
+        return float(ticker['price'])
+    except Exception as e:
+        logger.error(f"Erro ao obter preço do par {symbol}: {e}")
+        return 0.0
+
+def get_lot_size_limits(symbol: str):
+    """Retorna (min_qty, max_qty, step_size) do par."""
+    try:
+        symbol_info = client.get_symbol_info(symbol)
+        if symbol_info:
+            for f in symbol_info['filters']:
+                if f['filterType'] == 'LOT_SIZE':
+                    min_qty = float(f['minQty'])
+                    max_qty = float(f['maxQty'])
+                    step_size = float(f['stepSize'])
+                    return min_qty, max_qty, step_size
+        return None, None, None
+    except Exception as e:
+        logger.error(f"Erro ao obter LOT_SIZE para {symbol}: {e}")
+        return None, None, None
+
+def adjust_quantity(symbol: str, quantity: float) -> float:
+    """Ajusta 'quantity' para respeitar min_qty, max_qty e step_size."""
+    try:
+        min_qty, max_qty, step_size = get_lot_size_limits(symbol)
+        if min_qty is None or max_qty is None or step_size is None:
+            logger.error(f"Erro: Não foi possível obter os limites p/ {symbol}")
+            return 0
+
+        adjusted_quantity = math.floor(quantity / step_size) * step_size
+        casas_decimais = len(str(step_size).split('.')[1])
+        adjusted_quantity = round(adjusted_quantity, casas_decimais)
+
+        if adjusted_quantity < min_qty:
+            logger.warning(f"Qtd ajustada abaixo do mínimo: {adjusted_quantity} < {min_qty}")
+            return 0
+        if adjusted_quantity > max_qty:
+            logger.warning(f"Qtd ajustada acima do máximo: {adjusted_quantity} > {max_qty}")
+            return max_qty
+        
+        return adjusted_quantity
+    except Exception as e:
+        logger.error(f"Erro ao ajustar qtd: {e}")
+        return 0
+
+def buy_market(symbol: str, quantity: float):
+    """Executa ordem de compra a mercado."""
+    try:
+        order = client.order_market_buy(symbol=symbol, quantity=quantity)
+        logger.info(f"Ordem de COMPRA: {order}")
         return order
     except Exception as e:
-        print("Erro ao comprar BTC:", e)
+        logger.error(f"Erro ao comprar {symbol}: {e}")
         return None
 
-# Função para vender BTC
-def sell_btc(quantity):
+def sell_market(symbol: str, quantity: float):
+    """Executa ordem de venda a mercado (só se tivermos BNB)."""
     try:
-        order = client.order_market_sell(symbol='BTCUSDT', quantity=quantity)
-        print("Ordem de venda executada:", order)
+        order = client.order_market_sell(symbol=symbol, quantity=quantity)
+        logger.info(f"Ordem de VENDA: {order}")
         return order
     except Exception as e:
-        print("Erro ao vender BTC:", e)
+        logger.error(f"Erro ao vender {symbol}: {e}")
         return None
 
-# Inicializa o arquivo CSV para logs
-log_file = "trade_log.csv"
-if not os.path.exists(log_file):
-    with open(log_file, 'w') as f:
-        f.write("execution_time,action,signal_ml,btc_quantity,usdt_balance,btc_balance,btcusdt_price,close_now,predicted_close,profit_loss\n")
+def wait_for_next_close():
+    """
+    Aguarda até o próximo fechamento do candle (KLINE_INTERVAL).
+    Exemplo: se KLINE_INTERVAL=1h, aguarda fechar a hora.
+    """
+    try:
+        server_time = client.get_server_time()
+        current_time = int(time.time() * 1000)
+        time_diff = server_time['serverTime'] - current_time
+        adjusted_time = int(time.time() * 1000) + time_diff
 
-# Inicializa variáveis globais
-successful_trades = 0  # Contador de trades bem-sucedidas
-last_close_time = None  # Armazena o último fechamento de candle para evitar duplicações
-trade_results = deque(maxlen=10)  # Armazena os resultados dos últimos 10 trades
+        last_kline = client.get_klines(symbol=SYMBOL, interval=KLINE_INTERVAL, limit=1)[0]
+        next_close_time = last_kline[6]
+        wait_time = (next_close_time - adjusted_time) / 1000
 
-# Carregar histórico inicial de dados e calcular indicadores
-klines = client2.get_historical_klines("BTCUSDT", KLINE_INTERVAL, "1 jan, 2024")
-df = pd.DataFrame(klines, columns=['Open Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close Time',
-                                   'Quote Asset Volume', 'Number of Trades', 'Taker Buy Base Asset Volume',
-                                   'Taker Buy Quote Asset Volume', 'Ignore'])
+        if wait_time > 0:
+            logger.info(f"Aguardando candle fechar em {wait_time:.2f}s...")
+            time.sleep(wait_time)
+    except Exception as e:
+        logger.error(f"Erro ao aguardar candle: {e}")
+        time.sleep(60)
 
-df['Open Time'] = pd.to_datetime(df['Open Time'], unit='ms')
+# -----------------------------------------------------------------------
+#  CHECAGEM DE STOP LOSS E TAKE PROFIT (SEM SHORT)
+# -----------------------------------------------------------------------
+def check_sl_tp():
+    """
+    Roda periodicamente (25 min). Se existe posição comprada (open_position=True),
+    checa se preço atual atingiu SL ou TP. Se sim, vende tudo.
+    """
+    global open_position, entry_price, entry_quantity
+
+    if not open_position:
+        return  # Não há posição aberta, nada a fazer
+
+    symbol_price = get_symbol_price(SYMBOL)
+    if symbol_price <= 0:
+        return
+
+    # STOP LOSS se price <= entry * (1 - STOP_LOSS_PCT)
+    # TAKE PROFIT se price >= entry * (1 + TAKE_PROFIT_PCT)
+    stop_loss_price    = entry_price * (1 - STOP_LOSS_PCT)
+    take_profit_price  = entry_price * (1 + TAKE_PROFIT_PCT)
+
+    # Checa SL
+    if symbol_price <= stop_loss_price:
+        logger.info(f"[SL HIT] Preço={symbol_price:.4f}, SL={stop_loss_price:.4f}")
+        qty_to_sell = entry_quantity
+        qty_to_sell = adjust_quantity(SYMBOL, qty_to_sell)
+        if qty_to_sell > 0:
+            logger.info(f"Fechando posição (COMPRA) => vendendo {qty_to_sell} {BASE_ASSET}")
+            sell_market(SYMBOL, qty_to_sell)
+        open_position = False
+        entry_price   = 0.0
+        entry_quantity= 0.0
+
+    # Checa TP
+    elif symbol_price >= take_profit_price:
+        logger.info(f"[TP HIT] Preço={symbol_price:.4f}, TP={take_profit_price:.4f}")
+        qty_to_sell = entry_quantity
+        qty_to_sell = adjust_quantity(SYMBOL, qty_to_sell)
+        if qty_to_sell > 0:
+            logger.info(f"Fechando posição (COMPRA) => vendendo {qty_to_sell} {BASE_ASSET}")
+            sell_market(SYMBOL, qty_to_sell)
+        open_position = False
+        entry_price   = 0.0
+        entry_quantity= 0.0
+
+# -----------------------------------------------------------------------
+#     FUNÇÕES DE ML / BACKTEST (iguais às versões anteriores)
+# -----------------------------------------------------------------------
+def check_training_accuracy(X, y, df, model):
+    df_train = pd.DataFrame(index=X.index)
+    df_train['Close'] = df.loc[X.index, 'Close']
+    df_train['Next_Close'] = y
+
+    predictions = model.predict(X)
+    df_train['Predicted_Close'] = predictions
+
+    df_train['signal_ml'] = np.where(
+        df_train['Predicted_Close'] > df_train['Close'], 1, -1
+    )
+
+    df_train['price_change'] = df_train['Next_Close'] - df_train['Close']
+    conditions = [
+        (df_train['signal_ml'] == 1) & (df_train['price_change'] > 0),
+        (df_train['signal_ml'] == -1) & (df_train['price_change'] < 0),
+    ]
+    df_train['correct_signal'] = np.select(conditions, [1, 1], default=0)
+
+    correct_signals = df_train['correct_signal'].sum()
+    total_signals   = len(df_train)
+    accuracy        = correct_signals / total_signals if total_signals > 0 else 0
+    return accuracy, total_signals, correct_signals
+
+def generate_signals_for_all_history(df, model):
+    df = df.copy()
+    features = [
+        'Open', 'Close', 'High', 'Low', 'Volume',
+        'Quote Asset Volume','Number of Trades',
+        'Taker Buy Base Asset Volume','Taker Buy Quote Asset Volume',
+        'RSI_14', 'RSI_7',
+        'MACD_12_26_9', 'MACD_5_35_5',
+        'StochRSI_14', 'StochRSI_7'
+    ]
+    df.dropna(subset=features, inplace=True)
+    df['signal_ml'] = 0
+
+    for i in range(len(df) - 1):
+        row_features = df.iloc[i][features]
+        X = pd.DataFrame([row_features], columns=features)
+        predicted_close = model.predict(X)[0]
+        current_close   = df['Close'].iloc[i]
+        df.iloc[i, df.columns.get_loc('signal_ml')] = 1 if (predicted_close > current_close) else -1
+
+    return df
+
+# Carrega histórico
+logger.info("Carregando dados históricos...")
+klines = client2.get_historical_klines(SYMBOL, KLINE_INTERVAL, "1 jan, 2024")
+df = pd.DataFrame(
+    klines,
+    columns=[
+        'Open Time', 'Open', 'High', 'Low', 'Close', 'Volume',
+        'Close Time','Quote Asset Volume', 'Number of Trades',
+        'Taker Buy Base Asset Volume','Taker Buy Quote Asset Volume',
+        'Ignore'
+    ]
+)
+
+df['Open Time']  = pd.to_datetime(df['Open Time'],  unit='ms')
 df['Close Time'] = pd.to_datetime(df['Close Time'], unit='ms')
 df.set_index('Close Time', inplace=True)
 
-# Converte colunas numéricas
 df = df.astype({
-    'Open': 'float', 'High': 'float', 'Low': 'float', 'Close': 'float',
-    'Volume': 'float', 'Quote Asset Volume': 'float', 
-    'Taker Buy Base Asset Volume': 'float', 'Taker Buy Quote Asset Volume': 'float'
+    'Open': 'float',
+    'High': 'float',
+    'Low': 'float',
+    'Close': 'float',
+    'Volume': 'float',
+    'Quote Asset Volume': 'float',
+    'Taker Buy Base Asset Volume': 'float',
+    'Taker Buy Quote Asset Volume': 'float'
 })
 
-# Função para esperar até o próximo fechamento de candle
-def wait_for_next_close():
-    server_time = client.get_server_time()
-    current_time = int(time.time() * 1000)
-    time_diff = server_time['serverTime'] - current_time
-    adjusted_time = int(time.time() * 1000) + time_diff  # Sincroniza com o horário da Binance
-    
-    last_kline = client.get_klines(symbol="BTCUSDT", interval=KLINE_INTERVAL, limit=1)[0]
-    next_close_time = last_kline[6]  # Próximo Close Time em milissegundos
-    wait_time = (next_close_time - adjusted_time) / 1000  # Tempo restante em segundos
-    
-    if wait_time > 0:
-        print(f"Aguardando até o próximo fechamento de candle em {wait_time:.2f} segundos...")
-        time.sleep(wait_time)
+# Calcula indicadores
+indicadores = Indicadores()
+df['RSI_14']       = indicadores.compute_RSI(df['Close'], 14)
+df['RSI_7']        = indicadores.compute_RSI(df['Open'], 7)
+df['MACD_12_26_9'] = indicadores.compute_MACD(df['Close'], 12, 26, 9)
+df['MACD_5_35_5']  = indicadores.compute_MACD(df['Open'], 5, 35, 5)
+df['StochRSI_14']  = indicadores.get_stochastic_rsi(df['Close'], 14, 14)
+df['StochRSI_7']   = indicadores.get_stochastic_rsi(df['Open'], 7)
 
-# Função principal de trading contínuo
-def trading_bot():
-    global successful_trades, last_close_time, trade_results
-    indicadores = Indicadores()  # Instância dos indicadores
+df['Target'] = df['Close'].shift(-1)
+df.dropna(inplace=True)
 
-    min_qty, max_qty, step_size = get_lot_size_limits("BTCUSDT")
+logger.info(f"DF shape após indicadores e dropna: {df.shape}")
+
+# Treinamento inicial
+def train_model(df: pd.DataFrame):
+    features = [
+        'Open', 'Close', 'High', 'Low', 'Volume',
+        'Quote Asset Volume','Number of Trades',
+        'Taker Buy Base Asset Volume','Taker Buy Quote Asset Volume',
+        'RSI_14', 'RSI_7',
+        'MACD_12_26_9', 'MACD_5_35_5',
+        'StochRSI_14', 'StochRSI_7'
+    ]
+    df.dropna(subset=features + ['Target'], inplace=True)
+
+    X = df[features]
+    y = df['Target']
+
+    logger.info(f"Tamanho de X: {X.shape}. Treinando RandomForestRegressor...")
+
+    # Salva CSV p/ auditoria (opcional)
+    X_join = X.copy()
+    X_join['Target'] = y
+    X_join.to_csv('ml_data.csv', index=True)
+
+    model = using_RandomForestRegressor.fixed_params_RandomForestRegressor(X, y)
+    return model, X, y
+
+def get_signal(df: pd.DataFrame, model):
+    features = [
+        'Open', 'Close', 'High', 'Low', 'Volume',
+        'Quote Asset Volume','Number of Trades',
+        'Taker Buy Base Asset Volume','Taker Buy Quote Asset Volume',
+        'RSI_14', 'RSI_7',
+        'MACD_12_26_9', 'MACD_5_35_5',
+        'StochRSI_14', 'StochRSI_7'
+    ]
+    last_row = df.iloc[-1][features]
+    X_last  = pd.DataFrame([last_row], columns=features)
+    predicted_close = model.predict(X_last)[0]
+    current_close   = df['Close'].iloc[-1]
+
+    # +1 => prevê alta, -1 => prevê queda
+    return 1 if (predicted_close > current_close) else -1
+
+from backtest import Backtest
+model, X_train, y_train = train_model(df)
+acc_train, total_train, correct_train = check_training_accuracy(X_train, y_train, df, model)
+logger.info(
+    f"[ACURÁCIA TREINO] TotalRows={total_train}, Acertos={correct_train}, Acur={acc_train*100:.2f}%"
+)
+
+# -----------------------------------------------------------------------
+#   THREAD PRINCIPAL DO MODELO (RODA EM INTERVALO DE CANDLE)
+# -----------------------------------------------------------------------
+def dca_model_loop():
+    global open_position, entry_price, entry_quantity
+    global model, X_train, y_train
+
+    candle_count = 0
 
     while True:
-        # Espera até o próximo fechamento de candle
+        # Espera o candle fechar
         wait_for_next_close()
 
-        # Obtém o último candle
-        last_kline = client.get_klines(symbol="BTCUSDT", interval=KLINE_INTERVAL, limit=1)[0]
-        close_time = last_kline[6]  # Tempo de fechamento do último candle
+        # Atualiza DF com último candle
+        last_kline = client.get_klines(symbol=SYMBOL, interval=KLINE_INTERVAL, limit=1)[0]
+        new_row = pd.DataFrame([last_kline], columns=[
+            'Open Time','Open','High','Low','Close','Volume',
+            'Close Time','Quote Asset Volume','Number of Trades',
+            'Taker Buy Base Asset Volume','Taker Buy Quote Asset Volume',
+            'Ignore'
+        ])
+        new_row['Open Time']  = pd.to_datetime(new_row['Open Time'],  unit='ms')
+        new_row['Close Time'] = pd.to_datetime(new_row['Close Time'], unit='ms')
+        for c in ['Open','High','Low','Close','Volume',
+                  'Quote Asset Volume','Number of Trades',
+                  'Taker Buy Base Asset Volume','Taker Buy Quote Asset Volume']:
+            new_row[c] = new_row[c].astype(float)
+        new_row.set_index('Close Time', inplace=True)
 
-        # Evita duplicação: processa apenas se o fechamento for diferente do último
-        if close_time != last_close_time:
-            last_close_time = close_time  # Atualiza o último fechamento para o atual
+        df.loc[new_row.index[0], new_row.columns] = new_row.iloc[0]
+        if len(df) > MAX_CANDLES:
+            df.drop(df.index[0], inplace=True)
 
-            # Adiciona novo kline ao DataFrame e recalcula indicadores
-            new_kline = [last_kline]
-            new_row = pd.DataFrame(new_kline, columns=['Open Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close Time',
-                                                       'Quote Asset Volume', 'Number of Trades', 'Taker Buy Base Asset Volume',
-                                                       'Taker Buy Quote Asset Volume', 'Ignore'])
+        # Recalcula indicadores
+        indicadores = Indicadores()
+        df['RSI_14']       = indicadores.compute_RSI(df['Close'], 14)
+        df['RSI_7']        = indicadores.compute_RSI(df['Open'], 7)
+        df['MACD_12_26_9'] = indicadores.compute_MACD(df['Close'], 12, 26, 9)
+        df['MACD_5_35_5']  = indicadores.compute_MACD(df['Open'], 5, 35, 5)
+        df['StochRSI_14']  = indicadores.get_stochastic_rsi(df['Close'], 14, 14)
+        df['StochRSI_7']   = indicadores.get_stochastic_rsi(df['Open'], 7)
+        df['Target']       = df['Close'].shift(-1)
 
-            # Converte valores para float explicitamente
-            new_row['Open Time'] = pd.to_datetime(new_row['Open Time'], unit='ms')
-            new_row['Close Time'] = pd.to_datetime(new_row['Close Time'], unit='ms')
+        candle_count += 1
 
-            numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 
-                               'Quote Asset Volume', 'Number of Trades', 
-                               'Taker Buy Base Asset Volume', 'Taker Buy Quote Asset Volume']
-            for col in numeric_columns:
-                new_row[col] = new_row[col].astype(float)
+        # Re-treina a cada RETRAIN_INTERVAL
+        if candle_count % RETRAIN_INTERVAL == 0:
+            logger.info(f"Re-treinando modelo (candles={candle_count})...")
+            model, X_train, y_train = train_model(df)
+            acc2, tot2, cor2 = check_training_accuracy(X_train, y_train, df, model)
+            logger.info(
+                f"[ReTreino] Tamanho={tot2}, Acertos={cor2}, Acur={acc2*100:.2f}%"
+            )
+            # Backtest
+            df_bt = generate_signals_for_all_history(df.copy(), model)
+            acc_b, tot_b, cor_b = Backtest().check_signal_accuracy(df_bt)
+            logger.info(
+                f"[Backtest FULL] TotTrades={tot_b}, Corretos={cor_b}, Acur={acc_b*100:.2f}%"
+            )
 
-            new_row.set_index('Close Time', inplace=True)
+        # Sincroniza relógio
+        sync_time = subprocess.run(["w32tm", "/resync"], capture_output=True, text=True)
+        logger.info("Sincronizando relógio do sistema...")
+        if sync_time.stdout:
+            logger.info(sync_time.stdout)
+        if sync_time.stderr:
+            logger.error(sync_time.stderr)
 
-            # Atualiza o DataFrame principal com os novos dados
-            df.loc[new_row.index[0], new_row.columns] = new_row.iloc[0]
+        # Lê sinal do modelo
+        signal_ml = get_signal(df, model)
+        df['signal_ml'] = 0
+        df.loc[df.index[-1], 'signal_ml'] = signal_ml
 
-            # Recalcula os indicadores
-            df['RSI_14'] = indicadores.compute_RSI(df['Close'], 14)
-            df['RSI_7'] = indicadores.compute_RSI(df['Open'], 7)
-            df['MACD_12_26_9'] = indicadores.compute_MACD(df['Close'], 12, 26, 9)
-            df['MACD_5_35_5'] = indicadores.compute_MACD(df['Open'], 5, 35, 5)
-            df['StochRSI_14'] = indicadores.get_stochastic_rsi(df['Close'], 14, 14)
-            df['StochRSI_7'] = indicadores.get_stochastic_rsi(df['Open'], 7)
+        symbol_price  = get_symbol_price(SYMBOL)
+        quote_balance = get_asset_balance(QUOTE_ASSET)
+        base_balance  = get_asset_balance(BASE_ASSET)
 
-            # Definindo as features para o modelo
-            features = ['Open', 'Close', 'High', 'Low', 'Volume', 'Quote Asset Volume', 'Number of Trades',
-                        'Taker Buy Base Asset Volume', 'Taker Buy Quote Asset Volume', 'RSI_14', 'RSI_7',
-                        'MACD_12_26_9', 'MACD_5_35_5', 'StochRSI_14', 'StochRSI_7']
-            
-            df['Target'] = df['Close'].shift(-1)  # Target para o modelo
-            
-            # Prepara X e y para o modelo, evitando NaNs no y
-            df.dropna(inplace=True)
-            X = df[features]
-            y = df['Target']
+        logger.info(f"[Candle={candle_count}] Sinal={signal_ml}, Saldo= {quote_balance:.2f} USDT, {base_balance:.4f} BNB")
 
-            # Atualiza os dados para o modelo e faz a previsão
-            model = using_RandomForestRegressor.fixed_params_RandomForestRegressor(X, y)
-            df['Predicted_Close'] = model.predict(X)
+        # Se não temos posição aberta:
+        if not open_position:
+            if signal_ml == 1:  
+                # Compra ~70% do saldo USDT
+                if quote_balance > 10:
+                    qty_buy = (quote_balance * RISK_PERCENT_CAPITAL) / symbol_price
+                    qty_buy = adjust_quantity(SYMBOL, qty_buy)
+                    if qty_buy > 0:
+                        logger.info(f"ABRINDO COMPRA => {qty_buy} BNB (DCA)")
+                        buy_market(SYMBOL, qty_buy)
+                        open_position   = True
+                        entry_price     = symbol_price
+                        entry_quantity  = qty_buy
 
-            df['signal_ml'] = np.where(df['Predicted_Close'] > df['Close'], 1, -1)
-            signal_ml = df['signal_ml'].iloc[-1]
-            close_now = df['Close'].iloc[-1]
+            else:  
+                # signal = -1 => vender BNB se tiver (sem abrir short)
+                if base_balance > 0.001:
+                    qty_sell = base_balance * RISK_PERCENT_CAPITAL
+                    qty_sell = adjust_quantity(SYMBOL, qty_sell)
+                    if qty_sell > 0:
+                        logger.info(f"Vendendo BNB => {qty_sell} BNB (pois sinal=-1).")
+                        sell_market(SYMBOL, qty_sell)
+                        # Como não há "posição" formal, apenas esvaziamos BNB
+                        open_position  = False
+                        entry_price    = 0.0
+                        entry_quantity = 0.0
 
+        else:
+            # Já temos posição comprada
+            if signal_ml == 1:
+                # DCA extra (compra mais)
+                if quote_balance > 10:
+                    qty_buy = (quote_balance * RISK_PERCENT_CAPITAL) / symbol_price
+                    qty_buy = adjust_quantity(SYMBOL, qty_buy)
+                    if qty_buy > 0:
+                        logger.info(f"DCA extra: comprando +{qty_buy} BNB.")
+                        buy_market(SYMBOL, qty_buy)
+                        # Se quiser calcular preço médio, faça algo como:
+                        old_value   = entry_quantity * entry_price
+                        new_value   = qty_buy * symbol_price
+                        total_value = old_value + new_value
+                        entry_quantity += qty_buy
+                        entry_price     = total_value / entry_quantity
 
-            # Sincroniza o tempo do sistema com o servidor
-            sync_time = subprocess.run(["w32tm", "/resync"], capture_output=True, text=True)
-            print("Sincronizando relógio do sistema:")
-            print(sync_time.stdout)
-            print(sync_time.stderr)
+            else:
+                # Se o sinal ficou -1 e temos BNB => vendemos (fechamos posição)
+                if base_balance > 0.001:
+                    qty_to_sell = base_balance * RISK_PERCENT_CAPITAL
+                    qty_to_sell = adjust_quantity(SYMBOL, qty_to_sell)
+                    if qty_to_sell > 0:
+                        logger.info(f"Fechando posição => vendendo {qty_to_sell} BNB (sinal=-1).")
+                        sell_market(SYMBOL, qty_to_sell)
+                open_position  = False
+                entry_price    = 0.0
+                entry_quantity = 0.0
 
-            # Executa a ordem de compra ou venda baseada no sinal
-            usdt_balance = get_usdt_balance()
-            btc_balance = get_btc_balance()
-            btcusdt_price = get_btcusdt_price()
-            action = None
-            btc_quantity = 0
-            profit_loss = 0
+        # Log final
+        quote_balance = get_asset_balance(QUOTE_ASSET)
+        base_balance  = get_asset_balance(BASE_ASSET)
+        logger.info(f"Saldo pós: {quote_balance:.2f} USDT, {base_balance:.4f} BNB, entry_price={entry_price:.4f}")
 
-            
+        # Backtest rápido
+        df_copy = df.copy()
+        acc_x, tot_x, cor_x = Backtest().check_signal_accuracy(df_copy)
+        logger.info(
+            f"[Backtest FULL] TotTrades={tot_x}, Cor={cor_x}, Acur={acc_x*100:.2f}%"
+        )
+        logger.info("====================================")
 
-            if signal_ml == 1 and usdt_balance > 10:
-                print("Sinal de compra detectado!")
-                btc_quantity = (usdt_balance * 0.98) / btcusdt_price  
-                btc_quantity = adjust_quantity(btc_quantity, min_qty, max_qty, step_size)
+# -----------------------------------------------------------------------
+#   THREAD DE SL/TP (RODA A CADA 25 MIN)
+# -----------------------------------------------------------------------
+def sl_tp_loop():
+    while True:
+        logger.info("[SL/TP CHECK] Verificando Stop Loss / Take Profit...")
+        check_sl_tp()
+        time.sleep(SL_TP_CHECK_INTERVAL)
 
-                if btc_quantity > 0:  # Apenas executa a ordem se a quantidade for válida
-                    order = buy_btc(btc_quantity)
-                    if order:  # Verifica se a ordem foi bem-sucedida
-                        action = "buy"
-                        profit_loss = -btc_quantity * btcusdt_price  # Compra reduz saldo USDT
-                        trade_results.append({'action': action, 'result': None, 'profit_loss': 0})
-                    else:
-                        print("Erro ao executar ordem de compra.")
+# -----------------------------------------------------------------------
+#                               MAIN
+# -----------------------------------------------------------------------
+if __name__ == "__main__":
+    # Criamos 2 threads:
+    # 1) dca_model_loop(): segue o candle e faz DCA
+    # 2) sl_tp_loop(): checa SL e TP a cada 25 min
+    thread_dca = threading.Thread(target=dca_model_loop, daemon=True)
+    thread_sl  = threading.Thread(target=sl_tp_loop,   daemon=True)
 
-            elif signal_ml == -1 and btc_balance > min_qty:
-                print("Sinal de venda detectado!")
-                btc_quantity = adjust_quantity(btc_balance, min_qty, max_qty, step_size)
+    thread_dca.start()
+    thread_sl.start()
 
-                if btc_quantity > 0:  # Apenas executa a ordem se a quantidade for válida
-                    order = sell_btc(btc_quantity)
-                    if order:  # Verifica se a ordem foi bem-sucedida
-                        action = "sell"
-                        profit_loss = btc_quantity * btcusdt_price  # Venda aumenta saldo USDT
-                        trade_results.append({'action': action, 'result': 'win' if profit_loss > 0 else 'loss', 'profit_loss': profit_loss})
-                    else:
-                        print("Erro ao executar ordem de venda.")
-
-            # Cálculo de acurácias
-            total_trades = [trade['result'] for trade in trade_results if trade['result'] is not None]
-            accuracy_total = total_trades.count('win') / len(total_trades) if total_trades else 0
-            accuracy_last_10 = total_trades[-10:].count('win') / len(total_trades[-10:]) if len(total_trades) >= 10 else accuracy_total
-            accuracy_last_5 = total_trades[-5:].count('win') / len(total_trades[-5:]) if len(total_trades) >= 5 else accuracy_total
-            accuracy_last_2 = total_trades[-2:].count('win') / len(total_trades[-2:]) if len(total_trades) >= 2 else accuracy_total
-
-            print(f"Preço atual de BTCUSDT: {btcusdt_price}")
-            print(f"Saldo de USDT: {usdt_balance}")
-            print(f"Saldo de BTC: {btc_balance}")
-            print(f"Sinal do modelo: {signal_ml}")
-            print(f"Acurácia total: {accuracy_total:.2f}")
-            print(f"Acurácia dos últimos 10 trades: {accuracy_last_10:.2f}")
-            print(f"Acurácia dos últimos 5 trades: {accuracy_last_5:.2f}")
-            print(f"Acurácia dos últimos 2 trades: {accuracy_last_2:.2f}")
-
-            if trade_results:
-                last_trade = trade_results[-1]
-                print(f"Último trade: {'Acerto' if last_trade['result'] == 'win' else 'Erro'}")
-                print(f"Lucro/Prejuízo do último trade: {last_trade['profit_loss']:.2f}")
-
-            # Registro no log
-            execution_time = datetime.now()
-            with open(log_file, 'a') as f:
-                f.write(f"{execution_time},{action},{signal_ml},{btc_quantity},{usdt_balance},{btc_balance},{close_now},{btcusdt_price},{df['Predicted_Close'].iloc[-1]},{profit_loss}\n")
-
-            df.to_csv('df.csv')
-
-trading_bot()
+    # Mantém main vivo
+    while True:
+        time.sleep(60)  # ou qualquer outro valor

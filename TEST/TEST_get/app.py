@@ -30,13 +30,24 @@ def get_usdt_balance():
         sync_time()  # Re-sincronize o horário em caso de erro e tente novamente
         return 0.0
     
-def get_btcusdt_price():
-    ticker = client.get_symbol_ticker(symbol='BTCUSDT')
+def get_price():
+    ticker = client.get_symbol_ticker(symbol='BNBUSDT')
     return float(ticker['price'])
+
+def sell_btc(quantity):
+    try:
+        order = client.order_market_sell(symbol='BTCUSDT', quantity=quantity)
+        print("Ordem de venda executada:", order)
+        return order
+    except Exception as e:
+        print("Erro ao vender BTC:", e)
+        return None
+response = sell_btc(0.19141)
+
 
 
 usdt_balance = get_usdt_balance()
 print("Saldo de USDT:", usdt_balance)
 
-btcusdt_price = get_btcusdt_price()
-print("Preço de BTCUSDT:", btcusdt_price)
+btcusdt_price = get_price()
+print("Preço de BNBUSDT:", btcusdt_price)
