@@ -1,13 +1,3 @@
-# backtest_estrategia.py
-"""
-Backtest offline que replica a lógica de 'app.py' (DCA, SL/TP, 
-vendas parciais, etc.), porém:
- - Ao final de cada candle, o valor do broker do BT
-   é forçado a refletir (quote_balance + base_balance*close).
- - Inicia a simulação a partir de data específica.
- - Limita a compra/venda ao saldo real disponível.
-"""
-
 import backtrader as bt
 import pandas as pd
 import numpy as np
@@ -15,29 +5,25 @@ import numpy as np
 from IndicadoresMercado import Indicadores
 from MLModels import using_RandomForestRegressor
 
-# -------------------------------
-# REPLICA CONFIGS DO app.py
-# -------------------------------
-SYMBOL = "BNBUSDT"
-BASE_ASSET = "BNB"
-QUOTE_ASSET = "USDT"
+# ------------------------------------
+# CONFIGURAÇÕES DA "NOVA" ESTRATÉGIA
+# ------------------------------------
+STOP_LOSS_PCT = 0.03      # 3% de Stop Loss
+TAKE_PROFIT_PCT = 0.05    # 5% de Take Profit
+RISK_PERCENT_CAPITAL = 0.70
+MIN_NOTIONAL = 10.0       # Mínimo de 10 USDT para permitir a compra
 
-STOP_LOSS_PCT = 0.15   
-TAKE_PROFIT_PCT = 0.22 
-RISK_PERCENT_CAPITAL = 0.70   
-MIN_NOTIONAL = 10.0         # Ex.: 10 USDT min p/ operar
+# Capital inicial do backtest
+INITIAL_CASH = 10000.0
 
-# Ajuste se quiser outro capital inicial:
-INITIAL_QUOTE_BALANCE = 10000.0
-INITIAL_BASE_BALANCE  = 0.0
+# Data inicial do backtest
+BACKTEST_START_DATE = "2024-12-28"
 
-# DATA DE INÍCIO do backtest (exemplo):
-BACKTEST_START_DATE = "2024-07-06"
-
-# -------------------------------
-# FEED PERSONALIZADO
-# -------------------------------
 class ExtendedPandasData(bt.feeds.PandasData):
+    """
+    Feed que inclui coluna 'signal_ml' no DataFrame.
+    Se não houver 'signal_ml', definimos como 0.
+    """
     lines = ('signal_ml',)
     params = (
         ('signal_ml', 'signal_ml'),
@@ -56,179 +42,136 @@ class ExtendedPandasData(bt.feeds.PandasData):
         if 'signal_ml' not in self.p.dataname.columns:
             self.p.dataname['signal_ml'] = 0
 
-# -------------------------------
-# STRATEGY: REPRODUZ LÓGICA DO app.py
-# -------------------------------
+# ------------------------------------
+# ESTRATÉGIA USANDO ORDENS NATIVAS
+# ------------------------------------
 class FullReplicateStrategy(bt.Strategy):
     """
-    Reproduz a lógica do app.py, mas no final de cada candle
-    atualizamos self.broker.set_cash(...) para que o "Valor final"
-    reportado reflita de fato (quote_balance + base_balance*preço).
+    Estratégia que:
+      - Compõe posição (self.position) usando self.buy() 
+        quando sinal=+1 e não estamos comprados.
+      - DCA se já estamos comprados e sinal=+1 novamente.
+      - Fecha (self.close()) se sinal=-1.
+      - Aplica STOP LOSS e TAKE PROFIT checando 
+        se o preço atual ultrapassou as bandas definidas.
+      - Checa minNotional (size * preço >= 10).
+    Assim, o Backtrader enxerga as ORDENS e mostra 
+    setas de Buy/Sell no gráfico.
     """
-
-    def __init__(self):
-        # Estado de posição:
-        self.open_position   = False
-        self.entry_price     = 0.0
-        self.entry_quantity  = 0.0
-
-        # "Saldos"
-        self.quote_balance   = INITIAL_QUOTE_BALANCE
-        self.base_balance    = INITIAL_BASE_BALANCE
-
-        self.signal = self.datas[0].signal_ml
 
     def log(self, txt):
         dt = self.datas[0].datetime.datetime(0).strftime('%Y-%m-%d %H:%M')
         print(f"[{dt}] {txt}")
 
+    def __init__(self):
+        # Guardamos a referência ao campo 'signal_ml' do DataFrame
+        self.signal = self.datas[0].signal_ml
+
     def next(self):
+        # Preço atual do candle
         current_price = self.datas[0].close[0]
 
-        # 1) Stop Loss / Take Profit
-        if self.open_position:
-            stop_loss_price   = self.entry_price * (1 - STOP_LOSS_PCT)
-            take_profit_price = self.entry_price * (1 + TAKE_PROFIT_PCT)
+        # Se temos posição aberta, checar SL e TP
+        if self.position.size > 0:  # posição comprada
+            entry_price = self.position.price  # preço médio da posição
+            stop_loss_price   = entry_price * (1 - STOP_LOSS_PCT)
+            take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
+
             if current_price <= stop_loss_price:
-                self.log(f"[SL HIT] Price={current_price:.4f}, SL={stop_loss_price:.4f}")
-                self.close_position_all(current_price)
-            elif current_price >= take_profit_price:
-                self.log(f"[TP HIT] Price={current_price:.4f}, TP={take_profit_price:.4f}")
-                self.close_position_all(current_price)
+                self.log(f"[SL HIT] Price={current_price:.2f}, SL={stop_loss_price:.2f}")
+                # Fecha posição (gera seta de SELL no gráfico)
+                self.close()
+                return
 
-        # 2) Ler o sinal
-        signal_ml = int(self.signal[0])
+            if current_price >= take_profit_price:
+                self.log(f"[TP HIT] Price={current_price:.2f}, TP={take_profit_price:.2f}")
+                self.close()
+                return
 
-        # 3) Se não temos posição aberta
-        if not self.open_position:
-            if signal_ml == 1:
-                # "Compra ~70% do saldo USDT"
-                if self.quote_balance > MIN_NOTIONAL:
-                    amount_usdt = self.quote_balance * RISK_PERCENT_CAPITAL
-                    amount_usdt = min(amount_usdt, self.quote_balance)  # travar no saldo
-                    qty_buy     = amount_usdt / current_price
-                    qty_buy     = self.adjust_quantity(qty_buy)
+        # Ler o sinal do modelo
+        signal_ml = int(self.signal[0])  # +1 ou -1
+        cash_available = self.broker.getcash()
+        value_total    = self.broker.getvalue()  # cash + valor da posição
 
-                    cost = qty_buy * current_price
-                    if cost > self.quote_balance:
-                        cost = self.quote_balance
-                        qty_buy = self.adjust_quantity(cost / current_price)
+        # 1) Se não temos posição e sinal=+1 => Compra
+        if self.position.size == 0 and signal_ml == 1:
+            # Tenta comprar ~70% do capital
+            amount_usdt = value_total * RISK_PERCENT_CAPITAL
+            if amount_usdt > cash_available:  # não gastar mais do que o cash
+                amount_usdt = cash_available
 
-                    if qty_buy > 0:
-                        self.log(f"ABRINDO COMPRA => {qty_buy:.6f} BNB (DCA)")
-                        self.quote_balance -= cost
-                        self.base_balance  += qty_buy
-                        self.open_position   = True
-                        self.entry_price     = current_price
-                        self.entry_quantity  = qty_buy
-
-            else:  # signal=-1 => vender BNB parado (sem posição)
-                if self.base_balance > 0.001:
-                    qty_sell = self.base_balance * RISK_PERCENT_CAPITAL
-                    qty_sell = self.adjust_quantity(qty_sell)
-                    if qty_sell > self.base_balance:
-                        qty_sell = self.base_balance
-                    if qty_sell > 0:
-                        self.log(f"Vendendo BNB => {qty_sell:.6f} (sinal=-1, sem pos).")
-                        revenue = qty_sell * current_price
-                        self.base_balance  -= qty_sell
-                        self.quote_balance += revenue
-                        if self.base_balance < 0:
-                            self.base_balance = 0
-
-        # 4) Já temos posição comprada
-        else:
-            if signal_ml == 1:
-                # DCA
-                if self.quote_balance > MIN_NOTIONAL:
-                    amount_usdt = self.quote_balance * RISK_PERCENT_CAPITAL
-                    amount_usdt = min(amount_usdt, self.quote_balance)
-                    qty_buy     = amount_usdt / current_price
-                    qty_buy     = self.adjust_quantity(qty_buy)
-
-                    cost = qty_buy * current_price
-                    if cost > self.quote_balance:
-                        cost = self.quote_balance
-                        qty_buy = self.adjust_quantity(cost / current_price)
-
-                    if qty_buy > 0:
-                        self.log(f"DCA extra: comprando +{qty_buy:.6f} BNB.")
-                        self.quote_balance -= cost
-                        self.base_balance  += qty_buy
-                        # Recalcula preço médio
-                        old_val   = self.entry_price * self.entry_quantity
-                        new_val   = current_price * qty_buy
-                        total_val = old_val + new_val
-                        self.entry_quantity += qty_buy
-                        self.entry_price     = total_val / self.entry_quantity
+            # Calcula size
+            size = amount_usdt / current_price
+            # Checa minNotional
+            if (size * current_price) >= MIN_NOTIONAL:
+                self.log(f"ABRINDO COMPRA => size={size:.6f} (Close={current_price:.2f})")
+                self.buy(size=size)  # gera a seta de compra
             else:
-                # signal=-1 => vende RISK_PERCENT_CAPITAL do base_balance
-                if self.base_balance > 0.001:
-                    qty_to_sell = self.base_balance * RISK_PERCENT_CAPITAL
-                    qty_to_sell = self.adjust_quantity(qty_to_sell)
-                    if qty_to_sell > self.base_balance:
-                        qty_to_sell = self.base_balance
-                    if qty_to_sell > 0:
-                        self.log(f"Fechando posição => vendendo {qty_to_sell:.6f} BNB (sinal=-1).")
-                        revenue = qty_to_sell * current_price
-                        self.base_balance  -= qty_to_sell
-                        self.quote_balance += revenue
-                        if self.base_balance < 0:
-                            self.base_balance = 0
-                # Zera posição
-                self.open_position  = False
-                self.entry_price    = 0.0
-                self.entry_quantity = 0.0
+                self.log("Compra abortada: minNotional não atinge 10 USDT")
 
-        # 5) Ajusta o "valor do broker" p/ refletir saldo manual
-        total_value = self.quote_balance + (self.base_balance * current_price)
-        self.broker.set_cash(total_value)
+        # 2) Se já temos posição comprada e sinal=+1 => DCA (comprar mais)
+        elif self.position.size > 0 and signal_ml == 1:
+            # Exemplo de DCA
+            amount_usdt = cash_available * RISK_PERCENT_CAPITAL
+            if (amount_usdt > 0) and (amount_usdt >= MIN_NOTIONAL):
+                dca_size = amount_usdt / current_price
+                if (dca_size * current_price) >= MIN_NOTIONAL:
+                    self.log(f"DCA extra => size={dca_size:.6f} (Close={current_price:.2f})")
+                    self.buy(size=dca_size)
+                else:
+                    self.log("DCA abortada: minNotional não atinge 10 USDT")
 
-        # Log de saldo a cada candle
-        self.log(
-            f"Saldo => {self.quote_balance:.2f} USDT, "
-            f"{self.base_balance:.6f} BNB, "
-            f"entry_price={self.entry_price:.4f}, "
-            f"signal={signal_ml}, "
-            f"ValorTotal={total_value:.2f}"
-        )
+        # 3) Se temos posição comprada e sinal=-1 => Fechar tudo
+        elif self.position.size > 0 and signal_ml == -1:
+            self.log("Fechando posição => vendendo tudo (sinal=-1).")
+            self.close()  # gera seta vermelha de saída
 
-    def close_position_all(self, current_price):
-        """Fecha posição vendendo TODO o base_balance (para SL ou TP)."""
-        qty_to_sell = self.adjust_quantity(self.base_balance)
-        if qty_to_sell > self.base_balance:
-            qty_to_sell = self.base_balance
-        if qty_to_sell > 0:
-            self.log(f"Fechando posição [SL/TP] => vendendo {qty_to_sell:.6f} BNB.")
-            revenue = qty_to_sell * current_price
-            self.base_balance  -= qty_to_sell
-            self.quote_balance += revenue
-            if self.base_balance < 0:
-                self.base_balance = 0
-        self.open_position   = False
-        self.entry_price     = 0.0
-        self.entry_quantity  = 0.0
+        # 4) Se não temos posição e sinal=-1 => não faz nada 
+        #    (ou poderia shortar, mas não é o caso).
 
-    @staticmethod
-    def adjust_quantity(qty):
-        return round(qty, 6)
+    def notify_order(self, order):
+        """
+        Callback do Backtrader para acompanhar as ordens.
+        Podemos logar fills, status, etc.
+        """
+        if order.status in [order.Submitted, order.Accepted]:
+            # A ordem ainda está em processamento.
+            return
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f"ORD BUY EXEC: {order.executed.size:.4f} @ {order.executed.price:.4f}")
+            else:  # sell
+                self.log(f"ORD SELL EXEC: {order.executed.size:.4f} @ {order.executed.price:.4f}")
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log("Ordem cancelada / rejeitada / sem margem.")
+        # Zera a referência da ordem
+        order = None
 
-# -------------------------------
-# FUNÇÃO PRINCIPAL
-# -------------------------------
+    def notify_trade(self, trade):
+        """
+        Callback para acompanhar a evolução do trade.
+        Podemos logar PnL parcial, etc.
+        """
+        if not trade.isclosed:
+            return
+        self.log(f"TRADE FECHADO => PnL bruto: {trade.pnl:.2f}, PnL líquido: {trade.pnlcomm:.2f}")
+
+# ---------------------------------------------------------------------
+# FUNÇÃO PRINCIPAL DE BACKTEST
+# ---------------------------------------------------------------------
 def run_backtest():
-    # 1) Ler CSV gerado pelo app.py
     df = pd.read_csv('ml_data.csv', index_col=0)
-
-    # 2) Converte index e filtra data
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
     df.sort_index(inplace=True)
+
+    # Filtra a data inicial
     df = df.loc[df.index >= BACKTEST_START_DATE]
 
-    # 3) Se não existir 'signal_ml', recalcular
+    # Se não existir 'signal_ml', recalcular via ML
     if 'signal_ml' not in df.columns:
         print("[INFO] 'signal_ml' não encontrado. Recalculando via ML...")
+
         ind = Indicadores()
         needed = [
             'RSI_14','RSI_7','MACD_12_26_9','MACD_5_35_5','StochRSI_14','StochRSI_7'
@@ -257,9 +200,9 @@ def run_backtest():
             'StochRSI_14','StochRSI_7'
         ]
         df.dropna(subset=features + ['Target'], inplace=True)
+
         X = df[features]
         y = df['Target']
-
         model = using_RandomForestRegressor.fixed_params_RandomForestRegressor(X, y)
 
         df['signal_ml'] = 0
@@ -269,10 +212,10 @@ def run_backtest():
             current_close   = df['Close'].iloc[i]
             df.at[df.index[i], 'signal_ml'] = 1 if (predicted_close > current_close) else -1
 
-    # 4) Configura Backtrader
+    # Configura e roda o Backtrader
     cerebro = bt.Cerebro()
-    cerebro.broker.set_cash(10000.0)  # meramente simbólico
-    cerebro.broker.setcommission(commission=0.001)
+    cerebro.broker.set_cash(INITIAL_CASH)  
+    cerebro.broker.setcommission(commission=0.001)  # Ex.: 0.1%
 
     datafeed = ExtendedPandasData(dataname=df)
     cerebro.adddata(datafeed)
@@ -280,11 +223,13 @@ def run_backtest():
     cerebro.addstrategy(FullReplicateStrategy)
 
     print(f"===== Iniciando Backtest a partir de {BACKTEST_START_DATE} =====")
-    cerebro.run()
+    results = cerebro.run()
     print("===== Backtest finalizado =====")
+    final_value = cerebro.broker.getvalue()
+    print(f"[BT-Broker] Valor final: {final_value:.2f}")
 
-    # Valor final do broker => agora deve refletir nosso "valor_total"
-    print(f"[BT-Broker] Valor final: {cerebro.broker.getvalue():.2f}")
+    # Plot com as setas de Buy/Sell
+    cerebro.plot(style='candlestick')
 
 if __name__ == '__main__':
     run_backtest()

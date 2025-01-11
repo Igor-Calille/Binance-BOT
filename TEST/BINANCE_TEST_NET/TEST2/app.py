@@ -13,7 +13,8 @@ from binance.client import Client
 
 from IndicadoresMercado import Indicadores
 from MLModels import using_RandomForestRegressor
-from backtest import Backtest  # <- seu arquivo backtest.py
+from backtest import Backtest  # <- classe que avalia acerto direcional
+# Se tiver um "BacktestTrades" para PnL, poderia importar também.
 
 # -----------------------------------------------------------------------
 #                       CONFIGURAÇÕES DO LOG
@@ -30,33 +31,36 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------
 load_dotenv()
 
-SYMBOL = "BNBUSDT"
-BASE_ASSET = "BNB"
+
+
+SYMBOL = "SOLUSDT"      # Par a ser operado
+BASE_ASSET = "SOL"
 QUOTE_ASSET = "USDT"
 
-# Exemplo de SL e TP fixos para Altcoins
-STOP_LOSS_PCT = 0.15   
-TAKE_PROFIT_PCT = 0.22 
+# Stop Loss e Take Profit para timeframe de 1h
+STOP_LOSS_PCT = 0.06     # ex: 5%
+TAKE_PROFIT_PCT = 0.08   # ex: 7%
 
-RISK_PERCENT_CAPITAL = 0.70   # 70% do saldo p/ comprar ou vender (DCA)
-RETRAIN_INTERVAL = 5
-MAX_CANDLES = 5555
+# Risco e DCA
+RISK_PERCENT_CAPITAL = 0.95   # 70% do saldo p/ comprar/vender
+RETRAIN_INTERVAL = 5          # Re-treina a cada 5 candles
+MAX_CANDLES = 5555            # Máx. candles guardados em memória
 
-# Intervalos
-KLINE_INTERVAL = Client.KLINE_INTERVAL_1HOUR   # candle de 1 hora
+# Intervalo de 1 hora
+KLINE_INTERVAL = Client.KLINE_INTERVAL_1HOUR
 SL_TP_CHECK_INTERVAL = 25 * 60  # 25 minutos => 1500s
 
-# Credenciais (testnet ou principal)
+# Credenciais – escolha se é Testnet ou conta real
 testnet_api_key = os.getenv('TESTNET_API_KEY')
 testnet_api_secret = os.getenv('TESTNET_API_SECRET')
 client = Client(testnet_api_key, testnet_api_secret)
-client.API_URL = 'https://testnet.binance.vision/api'
+client.API_URL = 'https://testnet.binance.vision/api'  # Testnet
 
 api_key = os.getenv('API_KEY')
 api_secret = os.getenv('API_SECRET')
-client2 = Client(api_key, api_secret)
+client2 = Client(api_key, api_secret)  # Usado para histórico
 
-# Inicia serviço de tempo (Windows)
+# Inicia serviço de tempo no Windows
 start_service = subprocess.run(["net", "start", "w32time"], capture_output=True, text=True)
 logger.info("Iniciando serviço de tempo do Windows...")
 logger.info(start_service.stdout)
@@ -66,15 +70,15 @@ if start_service.stderr:
 # -----------------------------------------------------------------------
 #             VARIÁVEIS GLOBAIS DE CONTROLE DE POSIÇÃO
 # -----------------------------------------------------------------------
-open_position = False
-entry_price   = 0.0
-entry_quantity= 0.0
+open_position   = False
+entry_price     = 0.0
+entry_quantity  = 0.0
 
 # -----------------------------------------------------------------------
 #                       FUNÇÕES AUXILIARES
 # -----------------------------------------------------------------------
 def get_asset_balance(asset: str) -> float:
-    """Retorna o saldo 'free' (disponível) de um ativo."""
+    """Retorna o saldo 'free' (disponível) de um ativo na conta da Binance."""
     try:
         balance = client.get_asset_balance(asset=asset)
         if balance:
@@ -86,7 +90,7 @@ def get_asset_balance(asset: str) -> float:
         return 0.0
 
 def get_symbol_price(symbol: str) -> float:
-    """Retorna o último preço do par (ticker)."""
+    """Retorna o último preço (ticker) do par."""
     try:
         ticker = client.get_symbol_ticker(symbol=symbol)
         return float(ticker['price'])
@@ -94,48 +98,74 @@ def get_symbol_price(symbol: str) -> float:
         logger.error(f"Erro ao obter preço do par {symbol}: {e}")
         return 0.0
 
-def get_lot_size_limits(symbol: str):
-    """Retorna (min_qty, max_qty, step_size) do par."""
+def get_symbol_info_filters(symbol: str):
+    """Obtém filtros do par, p.ex. min_qty, max_qty, step_size, min_notional."""
     try:
-        symbol_info = client.get_symbol_info(symbol)
-        if symbol_info:
-            for f in symbol_info['filters']:
-                if f['filterType'] == 'LOT_SIZE':
-                    min_qty = float(f['minQty'])
-                    max_qty = float(f['maxQty'])
-                    step_size = float(f['stepSize'])
-                    return min_qty, max_qty, step_size
-        return None, None, None
+        info = client.get_symbol_info(symbol)
+        if not info:
+            return None
+        filters_dict = {}
+        for f in info['filters']:
+            f_type = f['filterType']
+            if f_type == 'LOT_SIZE':
+                filters_dict['min_qty'] = float(f['minQty'])
+                filters_dict['max_qty'] = float(f['maxQty'])
+                filters_dict['step_size'] = float(f['stepSize'])
+            elif f_type == 'MIN_NOTIONAL':
+                filters_dict['min_notional'] = float(f['minNotional'])
+        return filters_dict
     except Exception as e:
-        logger.error(f"Erro ao obter LOT_SIZE para {symbol}: {e}")
-        return None, None, None
+        logger.error(f"Erro ao obter symbol_info para {symbol}: {e}")
+        return None
 
-def adjust_quantity(symbol: str, quantity: float) -> float:
-    """Ajusta 'quantity' para respeitar min_qty, max_qty e step_size."""
+def adjust_quantity(symbol: str, quantity: float, price: float = None) -> float:
+    """
+    Ajusta 'quantity' para respeitar os limites de min_qty, max_qty, step_size e min_notional.
+    """
     try:
-        min_qty, max_qty, step_size = get_lot_size_limits(symbol)
-        if min_qty is None or max_qty is None or step_size is None:
-            logger.error(f"Erro: Não foi possível obter os limites p/ {symbol}")
+        fdict = get_symbol_info_filters(symbol)
+        if not fdict:
+            logger.error(f"Não foi possível obter filtros de {symbol}")
             return 0
 
+        min_qty = fdict.get('min_qty', 0)
+        max_qty = fdict.get('max_qty', float('inf'))
+        step_size = fdict.get('step_size', 1)
+        min_notional = fdict.get('min_notional', 10)
+
+        # Ajusta pela step_size
         adjusted_quantity = math.floor(quantity / step_size) * step_size
-        casas_decimais = len(str(step_size).split('.')[1])
+        casas_decimais = len(str(step_size).split('.')[1]) if '.' in str(step_size) else 0
         adjusted_quantity = round(adjusted_quantity, casas_decimais)
 
+        # Checa min_qty e max_qty
         if adjusted_quantity < min_qty:
-            logger.warning(f"Qtd ajustada abaixo do mínimo: {adjusted_quantity} < {min_qty}")
+            logger.warning(f"Quantidade ajustada abaixo do mínimo: {adjusted_quantity} < {min_qty}")
             return 0
         if adjusted_quantity > max_qty:
-            logger.warning(f"Qtd ajustada acima do máximo: {adjusted_quantity} > {max_qty}")
-            return max_qty
-        
+            logger.warning(f"Quantidade ajustada acima do máximo: {adjusted_quantity} > {max_qty}")
+            adjusted_quantity = max_qty
+
+        # Checa min_notional
+        if price is None or price <= 0:
+            price = get_symbol_price(symbol)
+            if price <= 0:
+                logger.error(f"Preço inválido para {symbol}: {price}")
+                return 0
+
+        notional = adjusted_quantity * price
+        if notional < min_notional:
+            logger.warning(f"Valor total ({notional:.2f}) < minNotional ({min_notional}). Abortar ajuste.")
+            return 0
+
         return adjusted_quantity
     except Exception as e:
-        logger.error(f"Erro ao ajustar qtd: {e}")
+        logger.error(f"Erro ao ajustar quantidade para {symbol}: {e}")
         return 0
 
+
 def buy_market(symbol: str, quantity: float):
-    """Executa ordem de compra a mercado."""
+    """Envia ordem de compra a mercado."""
     try:
         order = client.order_market_buy(symbol=symbol, quantity=quantity)
         logger.info(f"Ordem de COMPRA: {order}")
@@ -145,7 +175,7 @@ def buy_market(symbol: str, quantity: float):
         return None
 
 def sell_market(symbol: str, quantity: float):
-    """Executa ordem de venda a mercado (só se tivermos BNB)."""
+    """Envia ordem de venda a mercado."""
     try:
         order = client.order_market_sell(symbol=symbol, quantity=quantity)
         logger.info(f"Ordem de VENDA: {order}")
@@ -156,8 +186,8 @@ def sell_market(symbol: str, quantity: float):
 
 def wait_for_next_close():
     """
-    Aguarda até o próximo fechamento do candle (KLINE_INTERVAL).
-    Exemplo: se KLINE_INTERVAL=1h, aguarda fechar a hora.
+    Aguarda até o próximo fechamento do candle de 1h, 
+    usando a hora de fechamento do kline atual.
     """
     try:
         server_time = client.get_server_time()
@@ -166,7 +196,7 @@ def wait_for_next_close():
         adjusted_time = int(time.time() * 1000) + time_diff
 
         last_kline = client.get_klines(symbol=SYMBOL, interval=KLINE_INTERVAL, limit=1)[0]
-        next_close_time = last_kline[6]
+        next_close_time = last_kline[6]  # "close time" do kline atual
         wait_time = (next_close_time - adjusted_time) / 1000
 
         if wait_time > 0:
@@ -177,55 +207,54 @@ def wait_for_next_close():
         time.sleep(60)
 
 # -----------------------------------------------------------------------
-#  CHECAGEM DE STOP LOSS E TAKE PROFIT (SEM SHORT)
+#  CHECAGEM DE STOP LOSS E TAKE PROFIT (RODA EM THREAD)
 # -----------------------------------------------------------------------
 def check_sl_tp():
     """
-    Roda periodicamente (25 min). Se existe posição comprada (open_position=True),
-    checa se preço atual atingiu SL ou TP. Se sim, vende tudo.
+    Executado a cada SL_TP_CHECK_INTERVAL.
+    Se há posição aberta, verifica se o preço bateu SL ou TP. Se sim, vende tudo.
     """
     global open_position, entry_price, entry_quantity
 
     if not open_position:
-        return  # Não há posição aberta, nada a fazer
+        return
 
     symbol_price = get_symbol_price(SYMBOL)
     if symbol_price <= 0:
         return
 
-    # STOP LOSS se price <= entry * (1 - STOP_LOSS_PCT)
-    # TAKE PROFIT se price >= entry * (1 + TAKE_PROFIT_PCT)
-    stop_loss_price    = entry_price * (1 - STOP_LOSS_PCT)
-    take_profit_price  = entry_price * (1 + TAKE_PROFIT_PCT)
+    stop_loss_price   = entry_price * (1 - STOP_LOSS_PCT)
+    take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
 
-    # Checa SL
+    # STOP LOSS
     if symbol_price <= stop_loss_price:
         logger.info(f"[SL HIT] Preço={symbol_price:.4f}, SL={stop_loss_price:.4f}")
-        qty_to_sell = entry_quantity
-        qty_to_sell = adjust_quantity(SYMBOL, qty_to_sell)
+        qty_to_sell = adjust_quantity(SYMBOL, entry_quantity, price=symbol_price)
         if qty_to_sell > 0:
-            logger.info(f"Fechando posição (COMPRA) => vendendo {qty_to_sell} {BASE_ASSET}")
+            logger.info(f"Fechando posição => vendendo {qty_to_sell} {BASE_ASSET}")
             sell_market(SYMBOL, qty_to_sell)
-        open_position = False
-        entry_price   = 0.0
-        entry_quantity= 0.0
+        open_position  = False
+        entry_price    = 0.0
+        entry_quantity = 0.0
 
-    # Checa TP
+    # TAKE PROFIT
     elif symbol_price >= take_profit_price:
         logger.info(f"[TP HIT] Preço={symbol_price:.4f}, TP={take_profit_price:.4f}")
-        qty_to_sell = entry_quantity
-        qty_to_sell = adjust_quantity(SYMBOL, qty_to_sell)
+        qty_to_sell = adjust_quantity(SYMBOL, entry_quantity, price=symbol_price)
         if qty_to_sell > 0:
-            logger.info(f"Fechando posição (COMPRA) => vendendo {qty_to_sell} {BASE_ASSET}")
+            logger.info(f"Fechando posição => vendendo {qty_to_sell} {BASE_ASSET}")
             sell_market(SYMBOL, qty_to_sell)
-        open_position = False
-        entry_price   = 0.0
-        entry_quantity= 0.0
+        open_position  = False
+        entry_price    = 0.0
+        entry_quantity = 0.0
 
 # -----------------------------------------------------------------------
-#     FUNÇÕES DE ML / BACKTEST (iguais às versões anteriores)
+#     FUNÇÕES DE ML E BACKTEST
 # -----------------------------------------------------------------------
 def check_training_accuracy(X, y, df, model):
+    """
+    Verifica a acurácia direcional do modelo (se Close futuro > Close atual).
+    """
     df_train = pd.DataFrame(index=X.index)
     df_train['Close'] = df.loc[X.index, 'Close']
     df_train['Next_Close'] = y
@@ -236,8 +265,8 @@ def check_training_accuracy(X, y, df, model):
     df_train['signal_ml'] = np.where(
         df_train['Predicted_Close'] > df_train['Close'], 1, -1
     )
-
     df_train['price_change'] = df_train['Next_Close'] - df_train['Close']
+
     conditions = [
         (df_train['signal_ml'] == 1) & (df_train['price_change'] > 0),
         (df_train['signal_ml'] == -1) & (df_train['price_change'] < 0),
@@ -250,6 +279,10 @@ def check_training_accuracy(X, y, df, model):
     return accuracy, total_signals, correct_signals
 
 def generate_signals_for_all_history(df, model):
+    """
+    Gera 'signal_ml' = +1/-1 em todo o histórico, 
+    comparando 'predicted_close' e 'current_close'.
+    """
     df = df.copy()
     features = [
         'Open', 'Close', 'High', 'Low', 'Volume',
@@ -271,8 +304,8 @@ def generate_signals_for_all_history(df, model):
 
     return df
 
-# Carrega histórico
-logger.info("Carregando dados históricos...")
+# Carrega histórico inicial
+logger.info("Carregando dados históricos (desde 1 jan 2024)...")
 klines = client2.get_historical_klines(SYMBOL, KLINE_INTERVAL, "1 jan, 2024")
 df = pd.DataFrame(
     klines,
@@ -313,8 +346,8 @@ df.dropna(inplace=True)
 
 logger.info(f"DF shape após indicadores e dropna: {df.shape}")
 
-# Treinamento inicial
 def train_model(df: pd.DataFrame):
+    """Treina RandomForestRegressor c/ features e target."""
     features = [
         'Open', 'Close', 'High', 'Low', 'Volume',
         'Quote Asset Volume','Number of Trades',
@@ -330,7 +363,7 @@ def train_model(df: pd.DataFrame):
 
     logger.info(f"Tamanho de X: {X.shape}. Treinando RandomForestRegressor...")
 
-    # Salva CSV p/ auditoria (opcional)
+    # (Opcional) salva CSV
     X_join = X.copy()
     X_join['Target'] = y
     X_join.to_csv('ml_data.csv', index=True)
@@ -339,6 +372,7 @@ def train_model(df: pd.DataFrame):
     return model, X, y
 
 def get_signal(df: pd.DataFrame, model):
+    """Retorna +1 se previsão for alta, -1 se for queda, usando último candle."""
     features = [
         'Open', 'Close', 'High', 'Low', 'Volume',
         'Quote Asset Volume','Number of Trades',
@@ -352,18 +386,18 @@ def get_signal(df: pd.DataFrame, model):
     predicted_close = model.predict(X_last)[0]
     current_close   = df['Close'].iloc[-1]
 
-    # +1 => prevê alta, -1 => prevê queda
     return 1 if (predicted_close > current_close) else -1
 
-from backtest import Backtest
+# Treinamento inicial do modelo
 model, X_train, y_train = train_model(df)
 acc_train, total_train, correct_train = check_training_accuracy(X_train, y_train, df, model)
 logger.info(
-    f"[ACURÁCIA TREINO] TotalRows={total_train}, Acertos={correct_train}, Acur={acc_train*100:.2f}%"
+    f"[ACURÁCIA TREINO] TotalRows={total_train}, Acertos={correct_train}, "
+    f"Acur={acc_train*100:.2f}%"
 )
 
 # -----------------------------------------------------------------------
-#   THREAD PRINCIPAL DO MODELO (RODA EM INTERVALO DE CANDLE)
+#   THREAD PRINCIPAL (CANDLE A CANDLE)
 # -----------------------------------------------------------------------
 def dca_model_loop():
     global open_position, entry_price, entry_quantity
@@ -372,10 +406,10 @@ def dca_model_loop():
     candle_count = 0
 
     while True:
-        # Espera o candle fechar
+        # Espera o candle de 1h fechar
         wait_for_next_close()
 
-        # Atualiza DF com último candle
+        # Pega o último candle e atualiza df
         last_kline = client.get_klines(symbol=SYMBOL, interval=KLINE_INTERVAL, limit=1)[0]
         new_row = pd.DataFrame([last_kline], columns=[
             'Open Time','Open','High','Low','Close','Volume',
@@ -391,11 +425,12 @@ def dca_model_loop():
             new_row[c] = new_row[c].astype(float)
         new_row.set_index('Close Time', inplace=True)
 
+        # Adiciona ao df
         df.loc[new_row.index[0], new_row.columns] = new_row.iloc[0]
         if len(df) > MAX_CANDLES:
             df.drop(df.index[0], inplace=True)
 
-        # Recalcula indicadores
+        # Recalcula indicadores nas últimas linhas
         indicadores = Indicadores()
         df['RSI_14']       = indicadores.compute_RSI(df['Close'], 14)
         df['RSI_7']        = indicadores.compute_RSI(df['Open'], 7)
@@ -407,7 +442,7 @@ def dca_model_loop():
 
         candle_count += 1
 
-        # Re-treina a cada RETRAIN_INTERVAL
+        # A cada RETRAIN_INTERVAL, re-treina
         if candle_count % RETRAIN_INTERVAL == 0:
             logger.info(f"Re-treinando modelo (candles={candle_count})...")
             model, X_train, y_train = train_model(df)
@@ -415,14 +450,14 @@ def dca_model_loop():
             logger.info(
                 f"[ReTreino] Tamanho={tot2}, Acertos={cor2}, Acur={acc2*100:.2f}%"
             )
-            # Backtest
+            # Backtest "completo" (direcional) no dataset
             df_bt = generate_signals_for_all_history(df.copy(), model)
             acc_b, tot_b, cor_b = Backtest().check_signal_accuracy(df_bt)
             logger.info(
                 f"[Backtest FULL] TotTrades={tot_b}, Corretos={cor_b}, Acur={acc_b*100:.2f}%"
             )
 
-        # Sincroniza relógio
+        # Sincroniza relógio no Windows
         sync_time = subprocess.run(["w32tm", "/resync"], capture_output=True, text=True)
         logger.info("Sincronizando relógio do sistema...")
         if sync_time.stdout:
@@ -435,83 +470,84 @@ def dca_model_loop():
         df['signal_ml'] = 0
         df.loc[df.index[-1], 'signal_ml'] = signal_ml
 
+        # Consulta saldo e preço
         symbol_price  = get_symbol_price(SYMBOL)
         quote_balance = get_asset_balance(QUOTE_ASSET)
         base_balance  = get_asset_balance(BASE_ASSET)
 
-        logger.info(f"[Candle={candle_count}] Sinal={signal_ml}, Saldo= {quote_balance:.2f} USDT, {base_balance:.4f} BNB")
+        logger.info(
+            f"[Candle={candle_count}] Sinal={signal_ml}, "
+            f"Saldo= {quote_balance:.2f} USDT, {base_balance:.4f} BNB"
+        )
 
-        # Se não temos posição aberta:
+        # Lógica de entradas/saídas
         if not open_position:
-            if signal_ml == 1:  
-                # Compra ~70% do saldo USDT
+            if signal_ml == 1:
+                # Compra ~70% do saldo em USDT
                 if quote_balance > 10:
                     qty_buy = (quote_balance * RISK_PERCENT_CAPITAL) / symbol_price
-                    qty_buy = adjust_quantity(SYMBOL, qty_buy)
+                    qty_buy = adjust_quantity(SYMBOL, qty_buy, price=symbol_price)
                     if qty_buy > 0:
-                        logger.info(f"ABRINDO COMPRA => {qty_buy} BNB (DCA)")
+                        logger.info(f"ABRINDO COMPRA => {qty_buy} BNB")
                         buy_market(SYMBOL, qty_buy)
                         open_position   = True
                         entry_price     = symbol_price
                         entry_quantity  = qty_buy
-
-            else:  
-                # signal = -1 => vender BNB se tiver (sem abrir short)
-                if base_balance > 0.001:
-                    qty_sell = base_balance * RISK_PERCENT_CAPITAL
-                    qty_sell = adjust_quantity(SYMBOL, qty_sell)
+            else:
+                # Se sinal=-1, mas não temos posição => vender BNB leftover
+                if base_balance > 0.0001:
+                    qty_sell = adjust_quantity(SYMBOL, base_balance, price=symbol_price)
                     if qty_sell > 0:
-                        logger.info(f"Vendendo BNB => {qty_sell} BNB (pois sinal=-1).")
+                        logger.info(f"Zerando BNB => {qty_sell} BNB (sinal=-1).")
                         sell_market(SYMBOL, qty_sell)
-                        # Como não há "posição" formal, apenas esvaziamos BNB
-                        open_position  = False
-                        entry_price    = 0.0
-                        entry_quantity = 0.0
-
+                # Zera variáveis
+                open_position  = False
+                entry_price    = 0.0
+                entry_quantity = 0.0
         else:
-            # Já temos posição comprada
+            # Já estamos comprados
             if signal_ml == 1:
-                # DCA extra (compra mais)
+                # DCA
                 if quote_balance > 10:
                     qty_buy = (quote_balance * RISK_PERCENT_CAPITAL) / symbol_price
-                    qty_buy = adjust_quantity(SYMBOL, qty_buy)
+                    qty_buy = adjust_quantity(SYMBOL, qty_buy, price=symbol_price)
                     if qty_buy > 0:
                         logger.info(f"DCA extra: comprando +{qty_buy} BNB.")
                         buy_market(SYMBOL, qty_buy)
-                        # Se quiser calcular preço médio, faça algo como:
-                        old_value   = entry_quantity * entry_price
-                        new_value   = qty_buy * symbol_price
-                        total_value = old_value + new_value
+                        # Recalcula preço médio
+                        old_val  = entry_quantity * entry_price
+                        new_val  = qty_buy * symbol_price
+                        total    = old_val + new_val
                         entry_quantity += qty_buy
-                        entry_price     = total_value / entry_quantity
-
+                        entry_price     = total / entry_quantity
             else:
-                # Se o sinal ficou -1 e temos BNB => vendemos (fechamos posição)
-                if base_balance > 0.001:
-                    qty_to_sell = base_balance * RISK_PERCENT_CAPITAL
-                    qty_to_sell = adjust_quantity(SYMBOL, qty_to_sell)
-                    if qty_to_sell > 0:
-                        logger.info(f"Fechando posição => vendendo {qty_to_sell} BNB (sinal=-1).")
-                        sell_market(SYMBOL, qty_to_sell)
+                # Sinal=-1 => Fecha posição (vende tudo)
+                logger.info("Fechando posição => vendendo tudo.")
+                qty_to_sell = adjust_quantity(SYMBOL, base_balance, price=symbol_price)
+                if qty_to_sell > 0:
+                    sell_market(SYMBOL, qty_to_sell)
                 open_position  = False
                 entry_price    = 0.0
                 entry_quantity = 0.0
 
-        # Log final
+        # Checa saldo novamente
         quote_balance = get_asset_balance(QUOTE_ASSET)
         base_balance  = get_asset_balance(BASE_ASSET)
-        logger.info(f"Saldo pós: {quote_balance:.2f} USDT, {base_balance:.4f} BNB, entry_price={entry_price:.4f}")
+        logger.info(
+            f"Saldo pós: {quote_balance:.2f} USDT, {base_balance:.4f} BNB, "
+            f"entry_price={entry_price:.4f}"
+        )
 
-        # Backtest rápido
+        # Backtest rápido do df atual (acurácia direcional)
         df_copy = df.copy()
         acc_x, tot_x, cor_x = Backtest().check_signal_accuracy(df_copy)
         logger.info(
-            f"[Backtest FULL] TotTrades={tot_x}, Cor={cor_x}, Acur={acc_x*100:.2f}%"
+            f"[Backtest QUICK] TotTrades={tot_x}, Cor={cor_x}, Acur={acc_x*100:.2f}%"
         )
         logger.info("====================================")
 
 # -----------------------------------------------------------------------
-#   THREAD DE SL/TP (RODA A CADA 25 MIN)
+#   THREAD DE SL/TP (roda a cada 25 min p/ checar SL e TP)
 # -----------------------------------------------------------------------
 def sl_tp_loop():
     while True:
@@ -523,10 +559,16 @@ def sl_tp_loop():
 #                               MAIN
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Criamos 2 threads:
-    # 1) dca_model_loop(): segue o candle e faz DCA
-    # 2) sl_tp_loop(): checa SL e TP a cada 25 min
+
+    # Comando para iniciar o serviço de sincronização de tempo do win
+    start_service = subprocess.run(["net", "start", "w32time"], capture_output=True, text=True)
+    print("Iniciando serviço de tempo:")
+    print(start_service.stdout)
+    print(start_service.stderr)
+
+    # Thread 1: acompanha o candle e executa a lógica DCA
     thread_dca = threading.Thread(target=dca_model_loop, daemon=True)
+    # Thread 2: verifica SL e TP periodicamente
     thread_sl  = threading.Thread(target=sl_tp_loop,   daemon=True)
 
     thread_dca.start()
@@ -534,4 +576,4 @@ if __name__ == "__main__":
 
     # Mantém main vivo
     while True:
-        time.sleep(60)  # ou qualquer outro valor
+        time.sleep(60)
